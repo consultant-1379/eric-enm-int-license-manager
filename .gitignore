@@ -1,0 +1,7 @@
+*.idea
+*.bob
+*.iml
+design-rule-check-report*
+test-output*
+chart/eric-enm-int-license-manager*
+.kube*

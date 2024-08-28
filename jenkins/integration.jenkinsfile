@@ -1,0 +1,339 @@
+#!/usr/bin/env groovy
+import com.sun.org.apache.xerces.internal.impl.xpath.XPath
+
+def defaultBobImage = 'armdocker.rnd.ericsson.se/sandbox/adp-staging/adp-cicd/bob.2.0:1.5.2-0'
+
+
+pipeline {
+    agent {
+        node
+                {
+                    label SLAVE
+                }
+    }
+
+    parameters {
+        string(name: 'INT_LM_CHART_VERSION', defaultValue: '1.0.1-0', description: 'License Manager Integration Chart Version (e.g 1.0.1-0)')
+        string(name: 'INT_ASIH_CHART_VERSION', defaultValue: '1.0.1-0', description: 'Sys Info Integration Chart Version (e.g 1.0.1-0)')
+        string(name: 'INT_LM_DB_CHART_VERSION', defaultValue: '1.0.0-17', description: 'License Manager DB Integration Chart Version (e.g 1.0.1-0)')
+        string(name: 'SIM_VERSION', defaultValue: '0.5.0-99', description: 'The NeLS simulator version')
+        string(name: 'DB_VERSION', defaultValue: '8.18.0-11', description: 'The Document Database version (e.g. 8.18.0-11')
+        string(name: 'NAMESPACE', defaultValue: 'test-adp-lm-int', description: 'The namespace the test will be executed on')
+    }
+    environment {
+        cenm_utilities_docker_image = "armdocker.rnd.ericsson.se/proj-enm/cenm-build-utilities:latest"
+        kubeConfig = "${workspace}/.kube/admin.conf"
+        helm = "docker run --rm -v ${kubeConfig}:/root/.kube/config -v ${WORKSPACE}:${WORKSPACE} --workdir ${WORKSPACE} ${cenm_utilities_docker_image} helm"
+        kubectl = "docker run --rm  -v ${kubeConfig}:/root/.kube/config -v ${WORKSPACE}:${WORKSPACE} --workdir ${WORKSPACE} ${cenm_utilities_docker_image} kubectl"
+        intrepopath = "https://armdocker.rnd.ericsson.se/artifactory/proj-enm-helm-local"
+    }
+
+    stages {
+        stage('Inject Credentials file') {
+            steps {
+                script {
+                    withCredentials([file(credentialsId: 'cn_enm_staging.conf', variable: 'KUBECONFIG')]) {
+                        sh 'mkdir -p ${PWD}/.kube && chmod 775 ${PWD}/.kube'
+                        sh "install -m 755 ${KUBECONFIG} ${WORKSPACE}/.kube/admin.conf"
+                        sh "cat ${WORKSPACE}/.kube/admin.conf"
+                    }
+                }
+            }
+        }
+        stage('Clean') {
+            steps {
+                sh "if ${kubectl} get namespace ${NAMESPACE} &>/dev/null; then ${kubectl} delete namespace ${NAMESPACE} ; fi"
+            }
+        }
+        stage('Create namespace') {
+            steps {
+                sh "${kubectl} create namespace ${NAMESPACE}"
+            }
+        }
+        stage('Install sys-info-handler') {
+            steps {
+                script {
+                    sh "${helm} install -n ${NAMESPACE} sysinfo-handler \
+                    --set eric-si-application-sys-info-handler.asih.applicationId=applicationID-test \
+                   ${intrepopath}/eric-enm-int-sysinfo-handler/eric-enm-int-sysinfo-handler-${INT_ASIH_CHART_VERSION}.tgz"
+                }
+            }
+        }
+        stage('Create database.yaml File') {
+            steps {
+                script {
+                    def filename = "database.yaml"
+                    def content = "global:\n" +
+                            "  security:\n" +
+                            "    tls:\n" +
+                            "      enabled: false\n" +
+                            "\n" +
+                            "service:\n" +
+                            "  endpoints:\n" +
+                            "    postgres:\n" +
+                            "      tls:\n" +
+                            "        enforced: optional\n" +
+                            "\n" +
+                            "credentials:\n" +
+                            "  kubernetesSecretName: db-credentials-secret\n" +
+                            "\n" +
+                            "postgresConfig:\n" +
+                            "  max_prepared_transactions: 100\n" +
+                            "\n" +
+                            "persistentVolumeClaim:\n" +
+                            "  enabled: true\n" +
+                            "\n" +
+                            "  ## database data Persistent Volume Storage Class\n" +
+                            "  ## If defined in helm installation, persistentVolumeClaim volume will use defined value as storageClassName to create pvc.\n" +
+                            "  ## if not defined, it will use the default storage class on the kubernetes cluster.\n" +
+                            "  #storageClassName:\n" +
+                            "  size: 500Mi\n" +
+                            "  housekeeping_threshold: 100\n" +
+                            "\n" +
+                            "highAvailability:\n" +
+                            "  replicaCount: 1\n" +
+                            "\n" +
+                            "metrics:\n" +
+                            "  enabled: false"
+                    writeFile(file: filename, text: content)
+                }
+            }
+        }
+        stage('Create database-secret.yaml File') {
+            steps {
+                script {
+                    def filename = "database-secret.yaml"
+                    def content = "apiVersion: v1\n" +
+                            "kind: Secret\n" +
+                            "metadata:\n" +
+                            " name: db-credentials-secret\n" +
+                            "type: Opaque\n" +
+                            "data:\n" +
+                            " custom-user: \"YXBwdXNlcg==\"\n" +
+                            " custom-pwd: \"bndmMHJTSHZYRw==\"\n" +
+                            " super-pwd: \"cG9zdGdyZXM=\"\n" +
+                            " metrics-user: \"ZXhwb3J0ZXI=\"\n" +
+                            " metrics-pwd: \"MTIzNHF3ZXI=\"\n" +
+                            " replica-user: \"cmVwbGljYQ==\"\n" +
+                            " replica-pwd: \"cmVwbGljYQ==\"\n" +
+                            " application.user: \"YXBwdXNlcg==\"\n" +
+                            " application.password: \"MTdOT0hHZUVPeA==\"\n" +
+                            " management.user: \"amJvc3M=\"\n" +
+                            " management.password: \"WjNqM1UzZUxqcw==\"\n" +
+                            " database.user: \"cG9zdGdyZXM=\"\n" +
+                            " database.password: \"cG9zdGdyZXM=\"\n"
+                    writeFile(file: filename, text: content)
+                }
+            }
+        }
+        stage('install-document-database') {
+            steps {
+                script {
+                    sh "${kubectl} apply -f ./database-secret.yaml -n ${NAMESPACE}"
+                    sh "${helm} install database -f ./database.yaml -n ${NAMESPACE} \
+                        --set nameOverride=eric-lm-combined-server-db-pg \
+                        https://arm.sero.gic.ericsson.se/artifactory/proj-adp-gs-all-helm/eric-data-document-database-pg/eric-data-document-database-pg-${DB_VERSION}.tgz"
+                }
+            }
+        }
+        stage('Install eric-enm-int-license-manager-db') {
+            steps {
+                script {
+                    sh "${helm} install -n ${NAMESPACE} eric-enm-int-license-manager-db \
+                    --set database.credentials.secretName='db-credentials-secret' \
+                    --set database.host='eric-lm-combined-server-db-pg' \
+                    ${intrepopath}/eric-enm-int-license-manager-db/eric-enm-int-license-manager-db-${INT_LM_DB_CHART_VERSION}.tgz"
+                }
+            }
+        }
+        stage('Install eric-enm-int-license-manager') {
+            steps {
+                script {
+                    sh "${helm} install -n ${NAMESPACE} eric-enm-int-license-manager \
+                    --set database.credentials.secretName='eric-enm-int-license-manager-db-database-secret' \
+                    --set eric-lm-combined-server.database.credentials.secretName='eric-enm-int-license-manager-db-database-secret' \
+                    --set eric-lm-combined-server.database.host='eric-lm-combined-server-db-pg' \
+                    --set eric-lm-combined-server.global.ericsson.licensing.licenseDomains[0].productType='ENM' \
+                    --set eric-lm-combined-server.global.ericsson.licensing.licenseDomains[0].customerId='Ericsson' \
+                    --set eric-lm-combined-server.global.ericsson.licensing.licenseDomains[0].swltId='000001' \
+                    --set eric-lm-combined-server.licenseServerClient.licenseServer.thrift.host='eric-test-nels-simulator' \
+                    --set eric-lm-combined-server.licenseConsumerHandler.service.endpoints.externalHttps.tls.enforced='optional' \
+                    --set eric-lm-combined-server.global.licensing.sites[0].hostname='eric-test-nels-simulator' \
+                    --set eric-lm-combined-server.global.licensing.sites[0].priority=0 \
+                    --set eric-lm-combined-server.bandwidth.eric-lm-license-consumer-handler.maxEgressRate=null \
+                    --set eric-lm-combined-server.bandwidth.eric-lm-license-server-client.maxEgressRate=null \
+                    --set eric-lm-combined-server.licenseServerClient.timer.licenseRequestAggregationPeriod=60 \
+                    --set eric-lm-combined-server.licenseServerClient.timer.peakUsageReportAggregationPeriod=30 \
+                    --set metrics.enabled=true \
+                     ${intrepopath}/eric-enm-int-license-manager/eric-enm-int-license-manager-${INT_LM_CHART_VERSION}.tgz"
+                }
+            }
+        }
+        stage('Check eric-enm-int-license-manager properly Running') {
+            steps {
+                script {
+                    sh '''
+                        COUNTER=3
+                        for pod in $(${kubectl} get pods -n test-adp-lm-int --no-headers -o custom-columns=":metadata.name" | grep server-license); do
+                            sleep 5
+                            [ "$(${kubectl} get pods -n test-adp-lm-int ${pod} -o jsonpath="{.status.phase}")" == "Running" ]; COUNTER=$((COUNTER-1))
+                        done
+                        exit $COUNTER
+                    '''
+                }
+            }
+        }
+        stage("Install nels pull secret") {
+            steps {
+                script {
+                    withCredentials([file(credentialsId: 'lciadm100-docker-auth', variable: 'dockerConfig')]) {
+                        sh "install -m 644 ${dockerConfig} ${WORKSPACE}/config.json"
+                    }
+                    env.NELS_PULLSECRET = "nels-pullsecret"
+                    sh ( script: "${kubectl} -n ${NAMESPACE} --ignore-not-found=true delete secret ${NELS_PULLSECRET}", returnStdout: true).trim()
+                    sh ( script: "${kubectl} -n ${NAMESPACE} create secret generic ${NELS_PULLSECRET} --from-file=.dockerconfigjson=${WORKSPACE}/config.json --type=kubernetes.io/dockerconfigjson", returnStdout: true).trim()
+                }
+            }
+        }
+        stage("Install NeLS simulator") {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'nels-sim-token', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                        sh (script: "${helm} install --username ${USERNAME} --password ${PASSWORD} eric-test-nels-simulator -n ${NAMESPACE} --set imageCredentials.pullSecret=${NELS_PULLSECRET} https://arm.sero.gic.ericsson.se/artifactory/proj-adp-eric-test-nels-sim-helm/eric-test-nels-simulator/eric-test-nels-simulator-${SIM_VERSION}.tgz", returnStdout: true).trim()
+                    }
+                }
+            }
+        }
+        stage("Create NeLS Server") {
+            steps {
+                script {
+                    sh '''
+                        while [ `${kubectl} get pods -n ${NAMESPACE} | grep "eric-test-nels-simulator" | awk '{print $3}'` != "Running" ]; do echo "Waiting for Pod is Running"; sleep 1; done
+                        sleep 30
+                        nelspod=`${kubectl} get pods -n ${NAMESPACE} | grep "eric-test-nels-simulator" | awk '{print $1}\'`
+                        ${kubectl} exec ${nelspod} -n ${NAMESPACE} -- curl -i -w "\\n" --header "Content-Type: application/json" --request POST http://eric-test-nels-simulator:8080/nels-management/servers --data '{"serverName" : "ENM-PoC License Server", "thriftPort" : "9095", "capabilities" : [ { "name": "ClientDrivenAggregation", "status": true}, { "name": "LicenseInfoIntegrity", "status": true}, { "name": "NegativeUsageReporting", "status": true}, { "name": "PersistentPeak", "status": true} ]}'"" > ./server.txt
+                        export NELS_SIM_ID=$(cat server.txt | grep -i Location | sed -r "s|[Ll]ocation: .*/(.+)\\r$|\\1|")
+                    '''
+                }
+            }
+        }
+        stage("Start NeLS Server") {
+            steps {
+                script {
+                    sh '''
+                        export NELS_SIM_ID=$(cat server.txt | grep -i Location | sed -r "s|[Ll]ocation: .*/(.+)\\r$|\\1|")
+                        nelspod=`${kubectl} get pods -n ${NAMESPACE} | grep "eric-test-nels-simulator" | awk '{print $1}\'`
+                        ${kubectl} exec ${nelspod} -n ${NAMESPACE} -- curl -i -w "\\n" --header "Content-Type: application/json" --request PATCH eric-test-nels-simulator:8080/nels-management/servers/$NELS_SIM_ID --data '{ "status": "STARTED" }'""
+                   '''
+                }
+            }
+        }
+        stage("Create Licenses: CAPACITY CUMULATIVE - FEATURE - CAPACITY_PEAK") {
+            steps {
+                script {
+                    sh '''
+                        export NELS_SIM_ID=$(cat server.txt | grep -i Location | sed -r "s|[Ll]ocation: .*/(.+)\\r$|\\1|")
+                        nelspod=`${kubectl} get pods -n ${NAMESPACE} | grep "eric-test-nels-simulator" | awk '{print $1}\'` 
+                        ${kubectl} exec ${nelspod} -n ${NAMESPACE} -- curl -w "\\n" --header "Content-Type: application/json" --request POST eric-test-nels-simulator:8080/nels-management/servers/$NELS_SIM_ID/license-keys --data '{"productType":"ENM","customerId":"Ericsson","swltId":"000001","keys": [{"licenseId":"FAT1024487","licenseType":"CAPACITY_CUMULATIVE","start":"2022-11-07","stop":"2024-12-31","capacity":1000,"cumulativePeriod":{"start": "CALENDAR","length": "MONTH"}}, {"licenseId":"FAT1024496","licenseType":"FEATURE","start":"2022-11-07","stop":"2024-12-31"}, {"licenseId":"FAT1024497","licenseType":"CAPACITY_PEAK","start":"2022-11-07","stop":"2024-12-31","capacity":100}]}\'
+                    '''
+
+                }
+            }
+        }
+        stage("Install Multitool") {
+            steps {
+                script {
+                    sh '''
+                        docker pull wbitt/network-multitool
+                        ${kubectl} create deployment multitool --image=praqma/network-multitool -n ${NAMESPACE}
+                    '''
+                }
+            }
+        }
+        stage("Check All installed License") {
+            steps {
+                script {
+                    sh '''
+                        sleep 45
+                        multitoolpod=`${kubectl} get pods -n ${NAMESPACE} | grep "multitool" | awk '{print $1}\'` 
+                        if [ `${kubectl} exec ${multitoolpod} -n ${NAMESPACE} -- curl --location --request GET 'http://eric-lm-combined-server:8080/license-manager/api/v1/licenses' --header 'Content-Type: application/json' --data '{ "productType": "ENM" }\' | jq | grep "\\"licenseStatus\\": \\"VALID\\"" | wc -l` == 3 ]; then echo "Check License PASSED "; else exit 1 ; fi                        
+                    '''
+                }
+            }
+        }
+        stage("Get a specific License") {
+            steps {
+                script {
+                    sh '''
+                        sleep 5
+                        multitoolpod=`${kubectl} get pods -n ${NAMESPACE} | grep "multitool" | awk '{print $1}\'` 
+                        ${kubectl} exec ${multitoolpod} -n ${NAMESPACE} -- curl -X POST 'http://eric-lm-combined-server:8080/license-manager/api/v1/licenses/requests' -H 'Content-Type: application/json' -d '{ "productType": "ENM", "licenses": [{ "keyId": "FAT1024497","type": "CAPACITY_PEAK"}]} {"operationalStatusInfo":{"operationalMode":"NORMAL"},"usageReportPeriodPeak":54,"usageReportPeriodCumulative":54,"usageReportPeriodPeakPersistent":38880,"licenseRequestPeriod":3240,"licensesInfo":{["license":{"keyId":"FAT1024497","type":"CAPACITY_PEAK"},"licenseStatus":"VALID","capacityInfo":{"isLimited":true,"licensedCapacity":100,"unusedCapacity":88}}]}\' 
+                    '''
+                }
+            }
+        }
+        stage("Modify a License") {
+            steps {
+                script {
+                    sh '''
+                        sleep 5
+                        multitoolpod=`${kubectl} get pods -n ${NAMESPACE} | grep "multitool" | awk '{print $1}\'` 
+                        ${kubectl} exec ${multitoolpod} -n ${NAMESPACE} -- curl -w "\\n" --header "Content-Type: application/json" --request POST http://eric-lm-combined-server:8080/license-manager/api/v1/licenses/usage-reports --data '{"productType":"ENM", "consumerId":"12345678", "reports":[{"capacityKeyId":"FAT1024487","type":"PEAK","usage":100}]}\'
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            script {
+                sh "${kubectl} get pods -n ${NAMESPACE}"
+            }
+        }
+        success {
+            script {
+                sh "${kubectl} delete namespace ${NAMESPACE}"
+            }
+        }
+    }
+}
+
+// More about @Builder: http://mrhaki.blogspot.com/2014/05/groovy-goodness-use-builder-ast.html
+import groovy.transform.builder.Builder
+import groovy.transform.builder.SimpleStrategy
+
+@Builder(builderStrategy = SimpleStrategy, prefix = '')
+class BobCommand {
+    def bobImage = 'bob.2.0:latest'
+    def envVars = [:]
+    def needDockerSocket = false
+
+    String toString() {
+        def env = envVars
+                .collect({ entry -> "-e ${entry.key}=\"${entry.value}\"" })
+                .join(' ')
+
+        def cmd = """\
+        |docker run
+        |--init
+        |--rm
+        |--workdir \${PWD}
+        |--user \$(id -u):\$(id -g)
+        |-v \${PWD}:\${PWD}
+        |-v /etc/group:/etc/group:ro
+        |-v /etc/passwd:/etc/passwd:ro
+        |-v \${HOME}/.m2:\${HOME}/.m2
+        |-v \${HOME}/.docker:\${HOME}/.docker
+        |${needDockerSocket ? '-v /var/run/docker.sock:/var/run/docker.sock' : ''}
+        |${env}
+        |\$(for group in \$(id -G); do printf ' --group-add %s' "\$group"; done)
+        |--group-add \$(stat -c '%g' /var/run/docker.sock)
+        |${bobImage}
+        |"""
+        return cmd
+                .stripMargin()           // remove indentation
+                .replace('\n', ' ')      // join lines
+                .replaceAll(/[ ]+/, ' ') // replace multiple spaces by one
+    }
+}

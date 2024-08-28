@@ -1,0 +1,17 @@
+global:
+  ericsson:
+    licensing:
+      licenseDomains:
+        - productType: ENM
+          customerId: Ericsson
+          swltId: '000001'
+  licensing:
+    sites:
+      - hostname: eric-test-nels-simulator
+        priority: 0
+productRevision: 1.0.1
+database:
+  credentials:
+    secretName: test
+    secretPasswordKey: "testPK"
+    secretUsernameKey: "testUK"
